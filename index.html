@@ -489,4 +489,739 @@
             return activePointers.values().next().value || { x: 0, y: 0 };
         }
         
-        function getAve
+        function getAveragePointerPos() {
+            // Gibt die Durchschnittsposition aller aktiven Pointer zurück (für Zoom)
+            let x = 0, y = 0;
+            if (activePointers.size === 0) return { x, y };
+            for (const pos of activePointers.values()) {
+                x += pos.x;
+                y += pos.y;
+            }
+            return { x: x / activePointers.size, y: y / activePointers.size };
+        }
+        
+        function getPinchDistance() {
+            const pointers = Array.from(activePointers.values());
+            if (pointers.length < 2) return 0;
+            return Math.hypot(pointers[0].x - pointers[1].x, pointers[0].y - pointers[1].y);
+        }
+
+        function onPointerDown(e) {
+            e.preventDefault();
+            activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+            
+            const worldPos = screenToWorld(e.clientX, e.clientY);
+
+            if (activePointers.size === 2) {
+                // Start Zooming
+                interactionState.type = 'zooming';
+                interactionState.lastPinchDist = getPinchDistance();
+                return;
+            }
+
+            // Nur bei erstem Pointer
+            if (activePointers.size === 1) {
+                // Objekt platzieren
+                if (currentTool === 'place') {
+                    createObject(currentPlaceType, worldPos.x, worldPos.y);
+                    setTool('select');
+                    interactionState.type = 'idle';
+                    return;
+                }
+                
+                // Löschen
+                if (currentTool === 'delete') {
+                    const item = getItemAt(worldPos.x, worldPos.y);
+                    if (item) {
+                        selectedItem = item;
+                        deleteSelected();
+                    }
+                    interactionState.type = 'idle';
+                    return;
+                }
+
+                // Start Kabel ziehen
+                const targetSlot = getSlotAt(worldPos.x, worldPos.y);
+                if (targetSlot && (currentTool === 'wire' || currentTool === 'select')) {
+                    interactionState.type = 'wiring';
+                    interactionState.wiringStartSlot = targetSlot;
+                    setStatus(`Starte Kabel von Slot ${targetSlot.id} (${targetSlot.type})`);
+                    return;
+                }
+
+                // Start Objekt verschieben
+                const targetObject = getObjectAt(worldPos.x, worldPos.y);
+                if (targetObject && currentTool === 'select') {
+                    interactionState.type = 'dragging';
+                    interactionState.targetObjectId = targetObject.id;
+                    // Speichere den Offset von der Objekt-Ecke zum Klickpunkt
+                    interactionState.dragStartPos = { 
+                        x: worldPos.x - targetObject.x, 
+                        y: worldPos.y - targetObject.y
+                    };
+                    selectedItem = { type: 'object', id: targetObject.id };
+                    return;
+                }
+                
+                // Auswahl
+                if (currentTool === 'select') {
+                    const item = getItemAt(worldPos.x, worldPos.y);
+                    selectedItem = item;
+                    if(item) {
+                        setStatus(`Ausgewählt: ${item.type} ${item.id}`);
+                    }
+                }
+                
+                // Start Panning
+                interactionState.type = 'panning';
+                interactionState.lastPanPos = { x: e.clientX, y: e.clientY };
+                canvas.style.cursor = 'grabbing';
+            }
+        }
+
+        function onPointerMove(e) {
+            e.preventDefault();
+            
+            // Update die Position dieses Pointers
+            if (!activePointers.has(e.pointerId)) return;
+            activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+            
+            const worldPos = screenToWorld(e.clientX, e.clientY);
+
+            switch (interactionState.type) {
+                case 'zooming':
+                    if (activePointers.size === 2) {
+                        const newDist = getPinchDistance();
+                        const delta = newDist - interactionState.lastPinchDist;
+                        const avgPos = getAveragePointerPos();
+                        zoom(delta * 0.005, avgPos.x, avgPos.y); // Angepasste Zoom-Geschwindigkeit
+                        interactionState.lastPinchDist = newDist;
+                    }
+                    break;
+                
+                case 'dragging':
+                    if (interactionState.targetObjectId) {
+                        const obj = objects.find(o => o.id === interactionState.targetObjectId);
+                        if (obj) {
+                            // Wende den gespeicherten Offset an, um Springen zu verhindern
+                            obj.x = worldPos.x - interactionState.dragStartPos.x;
+                            obj.y = worldPos.y - interactionState.dragStartPos.y;
+                            
+                            // NaN-Check (wichtig!)
+                            if (isNaN(obj.x) || isNaN(obj.y)) {
+                                console.error("NaN detected! Resetting object position.");
+                                // Versuche, von einer bekannten guten Position wiederherzustellen
+                                obj.x = camera.x; 
+                                obj.y = camera.y;
+                                // Beende den Drag-Vorgang, um weitere Fehler zu vermeiden
+                                interactionState.type = 'idle';
+                            }
+                        }
+                    }
+                    break;
+                
+                case 'panning':
+                    const currentPanPos = { x: e.clientX, y: e.clientY };
+                    const deltaX = currentPanPos.x - interactionState.lastPanPos.x;
+                    const deltaY = currentPanPos.y - interactionState.lastPanPos.y;
+                    
+                    camera.x -= deltaX / camera.zoom;
+                    camera.y -= deltaY / camera.zoom;
+                    
+                    interactionState.lastPanPos = currentPanPos;
+                    break;
+                
+                case 'wiring':
+                    // Nur visuelles Update, Logik ist in gameLoop()
+                    break;
+            }
+        }
+
+        function onPointerUp(e) {
+            e.preventDefault();
+            
+            const worldPos = screenToWorld(e.clientX, e.clientY);
+            
+            switch (interactionState.type) {
+                case 'wiring':
+                    // Kabelziehen beenden
+                    const targetSlot = getSlotAt(worldPos.x, worldPos.y);
+                    if (targetSlot && targetSlot.id !== interactionState.wiringStartSlot.id) {
+                        createConnection(interactionState.wiringStartSlot, targetSlot);
+                        runSimulation();
+                    } else {
+                        setStatus('Kabelziehen abgebrochen.');
+                    }
+                    break;
+                
+                case 'dragging':
+                    // Dragging beenden
+                    // Nichts weiter zu tun, Position wurde in onPointerMove gesetzt
+                    break;
+                    
+                case 'panning':
+                    // Panning beenden
+                    if (currentTool === 'select') canvas.style.cursor = 'default';
+                    break;
+
+                case 'idle':
+                    // War ein "Click" (Down und Up ohne Move)
+                    // Schalter umschalten
+                    const targetObject = getObjectAt(worldPos.x, worldPos.y);
+                    if (targetObject && targetObject.type === 'switch') {
+                        targetObject.state = targetObject.state === 'closed' ? 'open' : 'closed';
+                        setStatus(`Schalter ${targetObject.id} auf ${targetObject.state} gesetzt.`);
+                        runSimulation();
+                    } else if (targetObject && targetObject.type === 'switchTwoWay') {
+                        targetObject.state = (targetObject.state === 'k1') ? 'k2' : 'k1';
+                        setStatus(`Wechselschalter ${targetObject.id} auf ${targetObject.state} gesetzt.`);
+                        runSimulation();
+                    }
+                    break;
+            }
+
+            // Pointer entfernen
+            activePointers.delete(e.pointerId);
+
+            // Zurücksetzen, wenn keine Pointer mehr aktiv sind
+            if (activePointers.size === 0) {
+                interactionState.type = 'idle';
+                interactionState.targetObjectId = null;
+                interactionState.wiringStartSlot = null;
+                if (currentTool === 'select') canvas.style.cursor = 'default';
+            } else if (activePointers.size === 1) {
+                // Wenn von Zoom (2 Finger) zu Pan (1 Finger) gewechselt wird
+                interactionState.type = 'panning';
+                interactionState.lastPanPos = getFirstPointerPos();
+                canvas.style.cursor = 'grabbing';
+            }
+        }
+
+        function onWheel(e) {
+            e.preventDefault();
+            const delta = -e.deltaY * 0.001; // Zoom-Geschwindigkeit
+            zoom(delta, e.clientX, e.clientY);
+        }
+        
+        // --- NEU: Zoom-Logik ---
+        function zoom(delta, screenX, screenY) {
+            const worldPosBeforeZoom = screenToWorld(screenX, screenY);
+            
+            camera.zoom = Math.min(Math.max(camera.zoom + delta * camera.zoom, camera.minZoom), camera.maxZoom);
+
+            const worldPosAfterZoom = screenToWorld(screenX, screenY);
+            
+            // Kamera anpassen, damit der Punkt unter der Maus fixiert bleibt
+            camera.x += worldPosBeforeZoom.x - worldPosAfterZoom.x;
+            camera.y += worldPosBeforeZoom.y - worldPosAfterZoom.y;
+        }
+
+        // --- NEU: Koordinaten-Transformation ---
+        
+        // Wandelt Bildschirm-Koordinaten (clientX, clientY) in Welt-Koordinaten um
+        function screenToWorld(screenX, screenY) {
+            const rect = canvas.getBoundingClientRect();
+            const x = screenX - rect.left; // Canvas-Koordinaten
+            const y = screenY - rect.top;
+            
+            return {
+                x: (x - canvas.width / 2) / camera.zoom + camera.x,
+                y: (y - canvas.height / 2) / camera.zoom + camera.y
+            };
+        }
+        
+        // --- Objekt- & Verbindungs-Logik (unverändert) ---
+
+        function loadDemoScene() {
+            camera.x = 350;
+            camera.y = 300;
+            
+            const p1 = createObject('powerSource', 100, 300);
+            const s1 = createObject('switch', 300, 200);
+            const l1 = createObject('lamp', 500, 200);
+            const d1 = createObject('socket', 300, 400);
+
+            createConnection(getSlotById(`${p1.id}-L`), getSlotById(`${s1.id}-in-L`));
+            createConnection(getSlotById(`${s1.id}-out-L`), getSlotById(`${l1.id}-L`));
+            createConnection(getSlotById(`${p1.id}-L`), getSlotById(`${d1.id}-L-1`)); 
+            createConnection(getSlotById(`${p1.id}-N`), getSlotById(`${l1.id}-N`));
+            createConnection(getSlotById(`${p1.id}-N`), getSlotById(`${d1.id}-N-1`)); 
+            createConnection(getSlotById(`${p1.id}-PE`), getSlotById(`${d1.id}-PE-1`));
+            
+            nextId = 10;
+            runSimulation();
+            setStatus("Beispiel-Szene geladen. Zoom/Pan & Mobile-Drag implementiert.");
+        }
+
+        function createObject(type, x, y) {
+            const id = `obj-${nextId++}`;
+            // NaN-Check direkt bei Erstellung
+            const safeX = isNaN(x) ? camera.x : x;
+            const safeY = isNaN(y) ? camera.y : y;
+
+            const obj = {
+                id: id,
+                type: type,
+                x: safeX, y: safeY,
+                w: 80, h: 50,
+                slots: [],
+                simState: null,
+            };
+
+            // Typspezifische Anpassungen
+            switch(type) {
+                case 'lamp':
+                    obj.w = 50; obj.h = 50;
+                    obj.slots.push({ id: `${id}-L`, type: 'L', parent: id });
+                    obj.slots.push({ id: `${id}-N`, type: 'N', parent: id });
+                    obj.slots.push({ id: `${id}-PE`, type: 'PE', parent: id });
+                    break;
+                case 'switch':
+                    obj.state = 'open'; 
+                    obj.slots.push({ id: `${id}-in-L`, type: 'L', parent: id });
+                    obj.slots.push({ id: `${id}-out-L`, type: 'L', parent: id });
+                    break;
+                case 'switchTwoWay': 
+                    obj.w = 80; obj.h = 60;
+                    obj.state = 'k1'; 
+                    obj.slots.push({ id: `${id}-L-in`, type: 'L', parent: id }); 
+                    obj.slots.push({ id: `${id}-K1-out`, type: 'AUX1', parent: id }); 
+                    obj.slots.push({ id: `${id}-K2-out`, type: 'AUX2', parent: id }); 
+                    break;
+                case 'socket':
+                    obj.w = 100; obj.h = 60;
+                    obj.slots.push({ id: `${id}-L-1`, type: 'L', parent: id }); 
+                    obj.slots.push({ id: `${id}-N-1`, type: 'N', parent: id }); 
+                    obj.slots.push({ id: `${id}-PE-1`, type: 'PE', parent:id }); 
+                    obj.slots.push({ id: `${id}-L-2`, type: 'L', parent: id }); 
+                    obj.slots.push({ id: `${id}-N-2`, type: 'N', parent: id }); 
+                    obj.slots.push({ id: `${id}-PE-2`, type: 'PE', parent: id });
+                    break;
+                case 'powerSource':
+                    obj.w = 80; obj.h = 60;
+                    obj.slots.push({ id: `${id}-L`, type: 'L', parent: id });
+                    obj.slots.push({ id: `${id}-N`, type: 'N', parent: id });
+                    obj.slots.push({ id: `${id}-PE`, type: 'PE', parent: id });
+                    break;
+                case 'junctionBox':
+                    obj.w = 200; obj.h = 150;
+                    obj.slots = []; 
+                    break;
+                case 'vago_2':
+                    obj.w = 50; obj.h = 35;
+                    obj.vagoType = 'ANY'; 
+                    obj.slots.push({ id: `${id}-S1`, type: 'ANY', parent: id });
+                    obj.slots.push({ id: `${id}-S2`, type: 'ANY', parent: id });
+                    break;
+                case 'vago_3':
+                    obj.w = 60; obj.h = 35;
+                    obj.vagoType = 'ANY';
+                    obj.slots.push({ id: `${id}-S1`, type: 'ANY', parent: id });
+                    obj.slots.push({ id: `${id}-S2`, type: 'ANY', parent: id });
+                    obj.slots.push({ id: `${id}-S3`, type: 'ANY', parent: id });
+                    break;
+                case 'vago_5':
+                    obj.w = 80; obj.h = 35;
+                    obj.vagoType = 'ANY';
+                    obj.slots.push({ id: `${id}-S1`, type: 'ANY', parent: id });
+                    obj.slots.push({ id: `${id}-S2`, type: 'ANY', parent: id });
+                    obj.slots.push({ id: `${id}-S3`, type: 'ANY', parent: id });
+                    obj.slots.push({ id: `${id}-S4`, type: 'ANY', parent: id });
+                    obj.slots.push({ id: `${id}-S5`, type: 'ANY', parent: id });
+                    break;
+            }
+            
+            objects.push(obj);
+            return obj;
+        }
+
+        function createConnection(fromSlot, toSlot) {
+            if (!fromSlot || !toSlot || fromSlot.id === toSlot.id) return;
+
+            const fromObj = getSlotById(fromSlot.id) ? objects.find(o => o.id === getSlotById(fromSlot.id).parent) : null;
+            const toObj = getSlotById(toSlot.id) ? objects.find(o => o.id === getSlotById(toSlot.id).parent) : null;
+
+            let effectiveFromType = fromSlot.type;
+            let effectiveToType = toSlot.type;
+            let aderToUse = null;
+
+            // 1. Vago-Färbe-Logik
+            if (toObj && toObj.type.startsWith('vago') && toObj.vagoType === 'ANY' && effectiveFromType !== 'ANY') {
+                toObj.vagoType = effectiveFromType;
+                toObj.slots.forEach(s => s.type = effectiveFromType);
+                effectiveToType = effectiveFromType; 
+                setStatus(`Vago ${toObj.id} ist jetzt Typ ${effectiveFromType}.`);
+            }
+            else if (fromObj && fromObj.type.startsWith('vago') && fromObj.vagoType === 'ANY' && effectiveToType !== 'ANY') {
+                fromObj.vagoType = effectiveToType;
+                fromObj.slots.forEach(s => s.type = effectiveToType);
+                effectiveFromType = effectiveToType;
+                setStatus(`Vago ${fromObj.id} ist jetzt Typ ${effectiveToType}.`);
+            }
+
+            // 2. Kompatibilitäts-Check
+            if (effectiveFromType === 'ANY' && effectiveToType === 'ANY') {
+                setStatus("Fehler: Kann nicht zwei 'ANY' Slots verbinden. Einer muss definiert sein.");
+                return;
+            }
+            
+            if (effectiveFromType !== 'ANY' && effectiveToType !== 'ANY' && effectiveFromType !== effectiveToType) {
+                setStatus(`Fehler: Slots passen nicht zusammen. (Von: ${effectiveFromType}, Zu: ${effectiveToType})`);
+                return;
+            }
+            
+            // 3. Ader-Typ bestimmen
+            aderToUse = (effectiveFromType !== 'ANY') ? effectiveFromType : effectiveToType;
+
+            const id = `conn-${nextId++}`;
+            connections.push({
+                id: id,
+                from: fromSlot.id,
+                to: toSlot.id,
+                aderType: aderToUse
+            });
+            setStatus(`Verbindung ${aderToUse} erstellt.`);
+        }
+
+        function deleteSelected() {
+            if (!selectedItem) {
+                setStatus("Nichts zum Löschen ausgewählt.");
+                return;
+            }
+
+            if (selectedItem.type === 'object') {
+                objects = objects.filter(o => o.id !== selectedItem.id);
+                connections = connections.filter(c => 
+                    !c.from.startsWith(selectedItem.id + '-') && 
+                    !c.to.startsWith(selectedItem.id + '-')
+                );
+                setStatus(`Objekt ${selectedItem.id} gelöscht.`);
+            } 
+            else if (selectedItem.type === 'connection') {
+                connections = connections.filter(c => c.id !== selectedItem.id);
+                setStatus(`Verbindung ${selectedItem.id} gelöscht.`);
+            }
+            
+            selectedItem = null;
+            runSimulation();
+        }
+
+        // --- Geometrie & Hit-Detection (angepasst für Zoom) ---
+
+        function getItemAt(worldX, worldY) {
+            const obj = getObjectAt(worldX, worldY);
+            if (obj) return { type: 'object', id: obj.id };
+            
+            const conn = getConnectionAt(worldX, worldY);
+            if (conn) return { type: 'connection', id: conn.id };
+
+            return null;
+        }
+
+        function getObjectAt(worldX, worldY) {
+            for (let i = objects.length - 1; i >= 0; i--) {
+                const obj = objects[i];
+                if (worldX >= obj.x && worldX <= obj.x + obj.w && worldY >= obj.y && worldY <= obj.y + obj.h) {
+                    return obj;
+                }
+            }
+            return null;
+        }
+
+        function getConnectionAt(worldX, worldY) {
+            const threshold = 10 / camera.zoom; 
+            for (const conn of connections) {
+                const fromSlot = getSlotById(conn.from);
+                const toSlot = getSlotById(conn.to);
+                if (!fromSlot || !toSlot) continue;
+
+                const p1 = getSlotAbsolutePos(fromSlot);
+                const p2 = getSlotAbsolutePos(toSlot);
+
+                const dx = p2.x - p1.x;
+                const dy = p2.y - p1.y;
+                const lenSq = dx * dx + dy * dy;
+                const t = ((worldX - p1.x) * dx + (worldY - p1.y) * dy) / lenSq;
+                
+                let closestX, closestY;
+                if (t < 0) {
+                    closestX = p1.x;
+                    closestY = p1.y;
+                } else if (t > 1) {
+                    closestX = p2.x;
+                    closestY = p2.y;
+                } else {
+                    closestX = p1.x + t * dx;
+                    closestY = p1.y + t * dy;
+                }
+
+                const dist = Math.hypot(worldX - closestX, worldY - closestY);
+                
+                if (dist < threshold) {
+                    return conn;
+                }
+            }
+            return null;
+        }
+
+        function getSlotAt(worldX, worldY) {
+            const threshold = 10 / camera.zoom; // Klick-Radius
+            for (const obj of objects) {
+                for (const slot of obj.slots) {
+                    const pos = getSlotAbsolutePos(slot);
+                    const dist = Math.hypot(worldX - pos.x, worldY - pos.y);
+                    if (dist <= threshold) {
+                        return slot;
+                    }
+                }
+            }
+            return null;
+        }
+
+        function getSlotById(id) {
+            for (const obj of objects) {
+                const slot = obj.slots.find(s => s.id === id);
+                if (slot) return slot;
+            }
+            return null;
+        }
+
+        // Berechnet die absolute (Welt) Position eines Slots
+        function getSlotAbsolutePos(slot) {
+            const obj = objects.find(o => o.id === slot.parent);
+            if (!obj) return { x: 0, y: 0 };
+            const relPos = getSlotRelativePos(slot);
+            return { x: obj.x + relPos.x, y: obj.y + relPos.y };
+        }
+
+        // Berechnet die relative Position eines Slots *innerhalb* seines Objekts
+        function getSlotRelativePos(slot) {
+            const obj = objects.find(o => o.id === slot.parent);
+            if (!obj) return { x: 0, y: 0 };
+
+            const index = obj.slots.findIndex(s => s.id === slot.id);
+            const total = obj.slots.length;
+
+            if (obj.type === 'socket') {
+                const side = Math.floor(index / 3); // 0 = links, 1 = rechts
+                const i_side = index % 3; // 0 (L), 1 (N), 2 (PE)
+                return {
+                    x: side === 0 ? 0 : obj.w, 
+                    y: (obj.h / 4) * (i_side + 1) 
+                }
+            }
+            
+            if (obj.type === 'switchTwoWay') {
+                if (slot.type === 'L') {
+                    return { x: 0, y: obj.h / 2 }; // L-Eingang links mitte
+                }
+                if (slot.type === 'AUX1') {
+                    return { x: obj.w, y: obj.h / 4 }; // K1 rechts oben
+                }
+                if (slot.type === 'AUX2') {
+                    return { x: obj.w, y: obj.h * 0.75 }; // K2 rechts unten
+                }
+            }
+            
+            if (obj.type.startsWith('vago')) {
+                return {
+                    x: (obj.w / (total + 1)) * (index + 1),
+                    y: obj.h / 2 
+                };
+            }
+
+            // Allgemeines Layout (oben/unten)
+            const isTop = index < total / 2;
+            const countOnSide = isTop ? Math.ceil(total / 2) : Math.floor(total / 2);
+            const indexOnSide = isTop ? index : index - Math.ceil(total / 2);
+
+            return {
+                x: (obj.w / (countOnSide + 1)) * (indexOnSide + 1),
+                y: isTop ? 0 : obj.h
+            };
+        }
+
+        // --- Simulations-Engine ---
+
+        function runSimulation() {
+            objects.forEach(obj => obj.simState = { status: 'off', message: 'Nicht geprüft' });
+
+            const powerSource = objects.find(o => o.type === 'powerSource');
+            if (!powerSource) {
+                setStatus("Simulation fehlgeschlagen: Keine Einspeisung (powerSource) gefunden.");
+                return;
+            }
+
+            const graph = buildGraph();
+            const sourceL = powerSource.slots.find(s => s.type === 'L').id;
+            const sourceN = powerSource.slots.find(s => s.type === 'N').id;
+            const sourcePE = powerSource.slots.find(s => s.type === 'PE').id;
+
+            objects.forEach(obj => {
+                if (obj.type === 'lamp' || obj.type === 'socket') {
+                    checkDevice(obj, graph, sourceL, sourceN, sourcePE);
+                }
+            });
+        }
+
+        function checkDevice(obj, graph, sourceL, sourceN, sourcePE) {
+            let hasL = false;
+            let hasN = false;
+            let hasPE = true; 
+
+            const lSlots = obj.slots.filter(s => s.type === 'L');
+            const nSlots = obj.slots.filter(s => s.type === 'N');
+            const peSlots = obj.slots.filter(s => s.type === 'PE');
+            
+            if (lSlots.length > 0) {
+                hasL = lSlots.some(slot => pathExists(slot.id, sourceL, 'L', graph, new Set()));
+            }
+            if (nSlots.length > 0) {
+                hasN = nSlots.some(slot => pathExists(slot.id, sourceN, 'N', graph, new Set()));
+            }
+            if (peSlots.length > 0) {
+                hasPE = peSlots.some(slot => pathExists(slot.id, sourcePE, 'PE', graph, new Set()));
+                if (obj.type === 'lamp' && !hasPE) hasPE = true; // PE ist für Lampe optional
+            } else if (obj.type === 'lamp') {
+                hasPE = true; 
+            }
+
+            if (!hasN) {
+                obj.simState = { status: 'error', message: `Fehler [${obj.id}]: Kein Neutralleiter (N) verbunden.` };
+            } else if (!hasPE) {
+                obj.simState = { status: 'error', message: `Fehler [${obj.id}]: Kein Schutzleiter (PE) verbunden.` };
+            } else if (!hasL) {
+                obj.simState = { status: 'off', message: 'Aus (Kein L-Pfad aktiv).' }; 
+            } else {
+                obj.simState = { status: 'ok', message: 'OK' }; 
+            }
+        }
+
+        function buildGraph() {
+            const graph = new Map();
+            objects.forEach(obj => obj.slots.forEach(s => graph.set(s.id, [])));
+            connections.forEach(conn => {
+                graph.get(conn.from)?.push(conn.to);
+                graph.get(conn.to)?.push(conn.from);
+            });
+            return graph;
+        }
+
+        function pathExists(startSlotId, endSlotId, aderType, graph, visited) {
+            if (startSlotId === endSlotId) return true;
+            visited.add(startSlotId);
+
+            const neighbors = graph.get(startSlotId) || [];
+            
+            // 1. Externe Nachbarn (Kabel)
+            for (const neighborId of neighbors) {
+                if (!visited.has(neighborId)) {
+                    const neighborSlot = getSlotById(neighborId);
+                    const conn = connections.find(c => 
+                        c.aderType === aderType && 
+                        ((c.from === startSlotId && c.to === neighborId) || (c.to === startSlotId && c.from === neighborId))
+                    );
+                    if (neighborSlot && conn && (neighborSlot.type === aderType || neighborSlot.type === 'ANY')) { 
+                        if (pathExists(neighborId, endSlotId, aderType, graph, visited)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // 2. Interne Nachbarn (Geräte-Logik)
+            const obj = objects.find(o => o.id === getSlotById(startSlotId).parent);
+            if (!obj) return false;
+
+            if (obj.type === 'switch' && aderType === 'L' && obj.state === 'closed') {
+                const inSlot = obj.slots.find(s => s.id.includes('-in-L')).id;
+                const outSlot = obj.slots.find(s => s.id.includes('-out-L')).id;
+                let internalNeighborId = null;
+                if (startSlotId === inSlot) internalNeighborId = outSlot;
+                if (startSlotId === outSlot) internalNeighborId = inSlot;
+                if (internalNeighborId && !visited.has(internalNeighborId)) {
+                    if (pathExists(internalNeighborId, endSlotId, 'L', graph, visited)) {
+                        return true;
+                    }
+                }
+            }
+            
+            else if (obj.type === 'switchTwoWay') {
+                const l_in_slot = obj.slots.find(s => s.type === 'L');
+                const k1_slot = obj.slots.find(s => s.type === 'AUX1');
+                const k2_slot = obj.slots.find(s => s.type === 'AUX2');
+                let internalNeighborSlot = null;
+                if (obj.state === 'k1') { // L <-> K1
+                    if (startSlotId === l_in_slot.id && aderType === 'L') internalNeighborSlot = k1_slot;
+                    if (startSlotId === k1_slot.id && aderType === 'AUX1') internalNeighborSlot = l_in_slot;
+                } else { // 'k2': L <-> K2
+                    if (startSlotId === l_in_slot.id && aderType === 'L') internalNeighborSlot = k2_slot;
+                    if (startSlotId === k2_slot.id && aderType === 'AUX2') internalNeighborSlot = l_in_slot;
+                }
+                if (internalNeighborSlot && !visited.has(internalNeighborSlot.id)) {
+                    if (pathExists(internalNeighborSlot.id, endSlotId, internalNeighborSlot.type, graph, visited)) {
+                        return true;
+                    }
+                }
+            }
+            
+            else if (obj.type.startsWith('vago') && obj.vagoType === aderType) {
+                for (const internalSlot of obj.slots) {
+                    if (internalSlot.id !== startSlotId && !visited.has(internalSlot.id)) {
+                        if (pathExists(internalSlot.id, endSlotId, aderType, graph, visited)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            
+            else if (obj.type === 'socket') {
+                // Alle Slots des gleichen Typs in einer Steckdose sind intern verbunden
+                const slotsOfType = obj.slots.filter(s => s.type === aderType);
+                for (const internalSlot of slotsOfType) {
+                     if (internalSlot.id !== startSlotId && !visited.has(internalSlot.id)) {
+                        if (pathExists(internalSlot.id, endSlotId, aderType, graph, visited)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            
+            return false;
+        }
+
+
+        // --- Hilfsfunktionen ---
+
+        function setTool(tool) {
+            currentTool = tool;
+            
+            document.querySelectorAll('.tool-btn').forEach(btn => btn.classList.remove('btn-active'));
+            const activeBtn = document.getElementById(`tool-${tool}`);
+            if (activeBtn) activeBtn.classList.add('btn-active');
+            
+            if (tool === 'delete') {
+                canvas.style.cursor = 'not-allowed';
+                setStatus('Modus: Löschen. Klicke auf ein Objekt oder Kabel.');
+            } else if (tool === 'wire') {
+                canvas.style.cursor = 'crosshair';
+                setStatus('Modus: Kabel ziehen. Klicke von Slot zu Slot.');
+            } else if (tool === 'place') {
+                canvas.style.cursor = 'copy';
+                setStatus(`Modus: Platzieren. Klicke auf den Canvas, um ${currentPlaceType} zu platzieren.`);
+            } else {
+                canvas.style.cursor = 'default';
+                setStatus('Modus: Auswählen/Verschieben (V).');
+            }
+        }
+
+        function setStatus(msg) {
+            statusBar.textContent = `Status: ${msg}`;
+        }
+
+        // --- Start ---
+        init();
+        gameLoop();
+    </script>
+</body>
+</html>
