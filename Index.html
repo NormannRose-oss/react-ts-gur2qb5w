@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>2D Elektro-Planer Demo</title>
+    <!-- Tailwind CSS via CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Manuelle Stile für bessere Mobile-Bedienung */
+        body {
+            font-family: 'Inter', sans-serif;
+            overscroll-behavior: none; /* Verhindert "Pull-to-Refresh" auf Mobilgeräten */
+        }
+        canvas {
+            touch-action: none; /* Wichtig für Touch-Gesten-Steuerung */
+            cursor: default;
+            background-color: #374151; /* Gray-700 */
+            width: 100%;
+            height: 100%;
+        }
+        .btn-active {
+            background-color: #4f46e5; /* Indigo-600 */
+            color: #ffffff;
+        }
+    </style>
+</head>
+<body class="bg-gray-800 text-gray-100 flex flex-col h-screen overflow-hidden">
+
+    <!-- Header / Toolbar -->
+    <header class="bg-gray-900 shadow-md p-2 flex flex-wrap justify-between items-center gap-2 z-10">
+        <h1 class="text-lg font-bold text-white">Elektro-Planer Demo</h1>
+        
+        <div class="flex flex-wrap items-center gap-3">
+            <!-- Werkzeug-Palette -->
+            <div class="flex gap-1 bg-gray-700 p-1 rounded-lg">
+                <button id="tool-select" class="tool-btn btn-active px-3 py-1 rounded-md text-sm" title="Auswählen & Verschieben (V)">Select</button>
+                <button id="tool-wire" class="tool-btn px-3 py-1 rounded-md text-sm" title="Kabel ziehen (W)">Wire</button>
+                <button id="tool-delete" class="tool-btn px-2 py-1 rounded-md text-sm text-red-400 hover:bg-red-600 hover:text-white" title="Löschen (Delete)">Delete</button>
+            </div>
+
+            <!-- Ader-Auswahl (wird von Vago-Logik ignoriert, aber hier gelassen) -->
+            <div class="flex items-center gap-2">
+                <label class="text-sm">Ader:</label>
+                <select id="ader-select" class="bg-gray-700 text-white rounded-md p-1 text-sm">
+                    <option value="L">L (Braun)</option>
+                    <option value="N">N (Blau)</option>
+                    <option value="PE">PE (Grün/Gelb)</option>
+                    <option value="AUX1">AUX1 (Schwarz)</option>
+                    <option value="AUX2">AUX2 (Orange)</option>
+                </select>
+            </div>
+
+            <!-- Objekt-Palette -->
+            <div class="flex flex-wrap gap-1">
+                <button class="object-btn px-2 py-1 bg-gray-600 hover:bg-indigo-500 rounded-md text-sm" data-type="powerSource">Einspeisung</button>
+                <button class="object-btn px-2 py-1 bg-gray-600 hover:bg-indigo-500 rounded-md text-sm" data-type="lamp">Lampe</button>
+                <button class="object-btn px-2 py-1 bg-gray-600 hover:bg-indigo-500 rounded-md text-sm" data-type="switch">Schalter</button>
+                <button class="object-btn px-2 py-1 bg-gray-600 hover:bg-indigo-500 rounded-md text-sm" data-type="switchTwoWay">Wechselschalter</button>
+                <button class="object-btn px-2 py-1 bg-gray-600 hover:bg-indigo-500 rounded-md text-sm" data-type="socket">Steckdose</button>
+                <button class="object-btn px-2 py-1 bg-gray-600 hover:bg-indigo-500 rounded-md text-sm" data-type="junctionBox">Verteilerbox</button>
+                <button class="object-btn px-2 py-1 bg-gray-600 hover:bg-indigo-500 rounded-md text-sm" data-type="vago_2">Vago (2x)</button>
+                <button class="object-btn px-2 py-1 bg-gray-600 hover:bg-indigo-500 rounded-md text-sm" data-type="vago_3">Vago (3x)</button>
+                <button class="object-btn px-2 py-1 bg-gray-600 hover:bg-indigo-500 rounded-md text-sm" data-type="vago_5">Vago (5x)</button>
+            </div>
+            
+            <!-- Aktionen -->
+            <div class="flex gap-1">
+                <button id="run-sim" class="px-3 py-1 bg-green-600 hover:bg-green-500 rounded-md text-sm font-medium">Testen</button>
+                <button id="clear-all" class="px-3 py-1 bg-red-700 hover:bg-red-600 rounded-md text-sm">Alles Löschen</button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Canvas-Container -->
+    <main class="flex-1 relative bg-gray-700 overflow-hidden">
+        <canvas id="editor-canvas" class="absolute top-0 left-0"></canvas>
+    </main>
+
+    <!-- Footer / Statusleiste -->
+    <footer class="bg-gray-900 p-2 text-sm text-gray-400 z-10">
+        <span id="status-bar">Status: Bereit. Wählen Sie ein Werkzeug.</span>
+    </footer>
+
+    <script type="module">
+        // --- Globale Variablen & Zustand ---
+        const canvas = document.getElementById('editor-canvas');
+        const ctx = canvas.getContext('2d');
+        const statusBar = document.getElementById('status-bar');
+
+        let objects = [];
+        let connections = [];
+        let nextId = 0;
+
+        let currentTool = 'select'; // select, wire, delete, place
+        let currentPlaceType = null;
+        let selectedItem = null; // { type: 'object' | 'connection', id: string }
+        
+        // --- NEU: Überarbeitete Kamera & Pointer-Logik ---
+        let camera = {
+            x: 0, // Kamera-Position (Welt-Koordinaten)
+            y: 0,
+            zoom: 1,
+            minZoom: 0.1,
+            maxZoom: 3
+        };
+        
+        // Verwaltet alle aktiven "Finger" oder Maus-Pointer
+        const activePointers = new Map();
+        
+        // Der aktuelle Zustand der Interaktion
+        let interactionState = {
+            type: 'idle', // idle, panning, dragging, wiring, zooming
+            targetObjectId: null,
+            dragStartPos: { x: 0, y: 0 },
+            wiringStartSlot: null,
+            lastPanPos: { x: 0, y: 0 },
+            lastPinchDist: 0,
+        };
+
+        // --- Farb-Definitionen ---
+        const ADER_COLORS = {
+            'L': '#A62929', // Dunkelrot (Braun-Ersatz)
+            'N': '#2952A6', // Dunkelblau
+            'PE': '#29A63E', // Grün
+            'AUX1': '#333333', // Schwarz/Grau
+            'AUX2': '#d97706', // Orange
+            'ANY': '#a1a1aa', // Grau-400
+        };
+
+        // --- Initialisierung ---
+        function init() {
+            resizeCanvas();
+            window.addEventListener('resize', resizeCanvas);
+            loadDemoScene();
+
+            // --- NEU: Pointer Event Listeners ---
+            canvas.addEventListener('pointerdown', onPointerDown, { passive: false });
+            canvas.addEventListener('pointermove', onPointerMove, { passive: false });
+            canvas.addEventListener('pointerup', onPointerUp, { passive: false });
+            canvas.addEventListener('pointercancel', onPointerUp, { passive: false });
+            canvas.addEventListener('pointerleave', onPointerUp, { passive: false });
+            canvas.addEventListener('wheel', onWheel, { passive: false }); 
+
+            // UI-Buttons
+            document.getElementById('tool-select').addEventListener('click', () => setTool('select'));
+            document.getElementById('tool-wire').addEventListener('click', () => setTool('wire'));
+            document.getElementById('tool-delete').addEventListener('click', deleteSelected);
+            
+            document.querySelectorAll('.object-btn').forEach(btn => {
+                btn.addEventListener('click', (e) => {
+                    currentPlaceType = e.target.dataset.type;
+                    setTool('place');
+                });
+            });
+
+            document.getElementById('run-sim').addEventListener('click', () => {
+                runSimulation();
+                setStatus('Simulation ausgeführt.');
+            });
+
+            document.getElementById('clear-all').addEventListener('click', () => {
+                objects = [];
+                connections = [];
+                nextId = 0;
+                camera.x = 0;
+                camera.y = 0;
+                camera.zoom = 1;
+                setStatus('Alles gelöscht.');
+            });
+            
+            window.addEventListener('keydown', (e) => {
+                if (e.key === 'Delete' || e.key === 'Backspace') {
+                    deleteSelected();
+                }
+            });
+        }
+
+        // --- Zeitschleife (Core Loop) ---
+        function gameLoop() {
+            if (canvas.width !== canvas.clientWidth || canvas.height !== canvas.clientHeight) {
+                resizeCanvas();
+            }
+
+            // Clear Canvas
+            ctx.fillStyle = '#374151'; // Gray-700
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // --- Kamera-Transformation anwenden ---
+            ctx.save();
+            ctx.translate(canvas.width / 2, canvas.height / 2); 
+            ctx.scale(camera.zoom, camera.zoom);
+            ctx.translate(-camera.x, -camera.y);
+
+            // Draw Grid (dynamisch)
+            drawGrid();
+
+            // Draw Content
+            drawConnections();
+            drawObjects();
+
+            // Draw wiring preview
+            if (interactionState.type === 'wiring' && interactionState.wiringStartSlot) {
+                const startPos = getSlotAbsolutePos(interactionState.wiringStartSlot);
+                const firstPointer = getFirstPointerPos();
+                const mouseWorldPos = screenToWorld(firstPointer.x, firstPointer.y);
+                
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 2 / camera.zoom; 
+                ctx.beginPath();
+                ctx.moveTo(startPos.x, startPos.y);
+                ctx.lineTo(mouseWorldPos.x, mouseWorldPos.y);
+                ctx.stroke();
+            }
+
+            // --- Transformation zurücksetzen ---
+            ctx.restore();
+
+            requestAnimationFrame(gameLoop);
+        }
+
+        function resizeCanvas() {
+            canvas.width = canvas.clientWidth;
+            canvas.height = canvas.clientHeight;
+        }
+
+        // --- Zeichenfunktionen (Rendering) ---
+        
+        function drawGrid() {
+            const gridSize = 50;
+            const lineThreshold = 0.05; 
+            
+            ctx.lineWidth = 1 / camera.zoom;
+            ctx.strokeStyle = '#2d3748'; // Gray-800
+            
+            if (ctx.lineWidth < lineThreshold) return; 
+
+            const worldTopLeft = screenToWorld(0, 0);
+            const worldBottomRight = screenToWorld(canvas.width, canvas.height);
+
+            const xStart = Math.floor(worldTopLeft.x / gridSize) * gridSize;
+            const xEnd = Math.ceil(worldBottomRight.x / gridSize) * gridSize;
+            const yStart = Math.floor(worldTopLeft.y / gridSize) * gridSize;
+            const yEnd = Math.ceil(worldBottomRight.y / gridSize) * gridSize;
+            
+            ctx.beginPath();
+            for (let x = xStart; x <= xEnd; x += gridSize) {
+                ctx.moveTo(x, yStart);
+                ctx.lineTo(x, yEnd);
+            }
+            for (let y = yStart; y <= yEnd; y += gridSize) {
+                ctx.moveTo(xStart, y);
+                ctx.lineTo(xEnd, y);
+            }
+            ctx.stroke();
+        }
+
+        function drawConnections() {
+            ctx.lineCap = 'round';
+            connections.forEach(conn => {
+                const fromSlot = getSlotById(conn.from);
+                const toSlot = getSlotById(conn.to);
+                
+                if (!fromSlot || !toSlot) return; 
+
+                const fromPos = getSlotAbsolutePos(fromSlot);
+                const toPos = getSlotAbsolutePos(toSlot);
+
+                ctx.strokeStyle = ADER_COLORS[conn.aderType] || '#ffffff';
+                
+                let baseLineWidth = 3;
+                
+                if (selectedItem && selectedItem.type === 'connection' && selectedItem.id === conn.id) {
+                    baseLineWidth = 7; 
+                    ctx.strokeStyle = '#3b82f6'; // Blau
+                }
+                
+                ctx.lineWidth = baseLineWidth / camera.zoom; 
+
+                ctx.beginPath();
+                ctx.moveTo(fromPos.x, fromPos.y);
+                ctx.lineTo(toPos.x, toPos.y);
+                ctx.stroke();
+            });
+        }
+
+        function drawObjects() {
+            const fontSize = 12 / camera.zoom;
+            ctx.font = `${fontSize}px Inter`;
+            
+            objects.forEach(obj => {
+                ctx.save();
+                ctx.translate(obj.x, obj.y);
+                
+                ctx.fillStyle = '#4b5563'; // Gray-600
+                ctx.strokeStyle = '#cbd5e0'; // Gray-300
+                
+                let baseLineWidth = 2;
+
+                if (selectedItem && selectedItem.type === 'object' && selectedItem.id === obj.id) {
+                    baseLineWidth = 4;
+                    ctx.strokeStyle = '#3b82f6'; // Blau
+                }
+                
+                ctx.lineWidth = baseLineWidth / camera.zoom;
+
+                // Simulations-Status-Highlight
+                if (obj.simState) {
+                    const shadowBlur = 15 / camera.zoom;
+                    ctx.shadowBlur = shadowBlur;
+                    if (obj.simState.status === 'ok') {
+                        ctx.strokeStyle = '#29A63E'; // Grün
+                        ctx.shadowColor = '#29A63E';
+                    } else if (obj.simState.status === 'error') {
+                        ctx.strokeStyle = '#A62929'; // Rot
+                        ctx.shadowColor = '#A62929';
+                    } else if (obj.simState.status === 'off') {
+                        ctx.strokeStyle = '#a1a1aa'; // Grau-400
+                        ctx.shadowColor = '#a1a1aa';
+                    }
+                }
+
+                // Objekttyp-spezifisches Zeichnen
+                switch(obj.type) {
+                    case 'lamp': drawLamp(obj); break;
+                    case 'switch': drawSwitch(obj); break;
+                    case 'switchTwoWay': drawSwitchTwoWay(obj); break;
+                    case 'socket': drawSocket(obj); break;
+                    case 'powerSource': drawPowerSource(obj); break;
+                    case 'junctionBox': drawJunctionBox(obj); break; 
+                    case 'vago_2': drawVago(obj); break;
+                    case 'vago_3': drawVago(obj); break;
+                    case 'vago_5': drawVago(obj); break;
+                }
+                
+                ctx.shadowBlur = 0;
+                
+                // Slots (Andockpunkte) zeichnen
+                drawSlots(obj);
+
+                ctx.restore();
+            });
+        }
+        
+        // --- Spezifische Objekt-Zeichner ---
+        
+        function drawLamp(obj) {
+            ctx.beginPath();
+            ctx.arc(obj.w / 2, obj.h / 2, obj.w / 2, 0, 2 * Math.PI);
+            ctx.fill();
+            ctx.stroke();
+            if (obj.simState && obj.simState.status === 'ok') {
+                ctx.fillStyle = '#f59e0b'; // Amber-500
+                ctx.shadowBlur = 20 / camera.zoom;
+                ctx.shadowColor = '#f59e0b';
+                ctx.fill();
+            }
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText('L1', obj.w/2 - 5 / camera.zoom, obj.h/2 + 5 / camera.zoom);
+        }
+
+        function drawSwitch(obj) {
+            ctx.beginPath();
+            ctx.roundRect(0, 0, obj.w, obj.h, 5);
+            ctx.fill();
+            ctx.stroke();
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText('S1', obj.w/2 - 5 / camera.zoom, obj.h/2 + 5 / camera.zoom);
+            
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 3 / camera.zoom;
+            ctx.beginPath();
+            ctx.moveTo(5, obj.h / 2); // IN
+            if (obj.state === 'closed') {
+                ctx.lineTo(obj.w - 5, obj.h / 2); // Geschlossen
+            } else {
+                ctx.lineTo(obj.w - 5, 10); // Offen
+            }
+            ctx.stroke();
+        }
+
+        function drawSwitchTwoWay(obj) {
+            ctx.beginPath();
+            ctx.roundRect(0, 0, obj.w, obj.h, 5);
+            ctx.fill();
+            ctx.stroke();
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText('Wechsel', obj.w/2 - 15 / camera.zoom, obj.h/2 + 5 / camera.zoom);
+            
+            ctx.strokeStyle = '#ffffff';
+            ctx.lineWidth = 3 / camera.zoom;
+            
+            const l_in_pos = getSlotRelativePos(obj.slots.find(s => s.type === 'L'));
+            const k1_pos = getSlotRelativePos(obj.slots.find(s => s.type === 'AUX1'));
+            const k2_pos = getSlotRelativePos(obj.slots.find(s => s.type === 'AUX2'));
+            
+            ctx.beginPath();
+            ctx.moveTo(l_in_pos.x, l_in_pos.y);
+            if (obj.state === 'k1') {
+                ctx.lineTo(k1_pos.x, k1_pos.y); // Verbunden mit K1
+            } else { // 'k2'
+                ctx.lineTo(k2_pos.x, k2_pos.y); // Verbunden mit K2
+            }
+            ctx.stroke();
+        }
+
+        function drawSocket(obj) {
+            ctx.beginPath();
+            ctx.roundRect(0, 0, obj.w, obj.h, 10);
+            ctx.fill();
+            ctx.stroke();
+            
+            ctx.fillStyle = '#374151'; // Innen
+            ctx.strokeStyle = '#9ca3af';
+            ctx.lineWidth = 2 / camera.zoom;
+            // 2 Löcher
+            ctx.beginPath();
+            ctx.arc(obj.w / 2 - 15, obj.h / 2, 8, 0, 2 * Math.PI);
+            ctx.fill();
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.arc(obj.w / 2 + 15, obj.h / 2, 8, 0, 2 * Math.PI);
+            ctx.fill();
+            ctx.stroke();
+        }
+        
+        function drawPowerSource(obj) {
+            ctx.beginPath();
+            ctx.roundRect(0, 0, obj.w, obj.h, 5);
+            ctx.fill();
+            ctx.stroke();
+            ctx.fillStyle = '#ffffff';
+            ctx.fillText('Netz', obj.w/2 - 10 / camera.zoom, obj.h/2 + 5 / camera.zoom);
+            
+            ctx.strokeStyle = '#f59e0b';
+            ctx.lineWidth = 3 / camera.zoom;
+            ctx.beginPath();
+            ctx.moveTo(obj.w / 2 - 10, 10);
+            ctx.lineTo(obj.w / 2 + 10, 25);
+            ctx.lineTo(obj.w / 2, 25);
+            ctx.lineTo(obj.w / 2, 40);
+            ctx.stroke();
+        }
+
+        function drawJunctionBox(obj) {
+            ctx.strokeStyle = '#a1a1aa'; // Gray-400
+            ctx.lineWidth = 4 / camera.zoom;
+            ctx.setLineDash([10, 5]);
+            ctx.beginPath();
+            ctx.roundRect(0, 0, obj.w, obj.h, 15);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.fillStyle = '#71717a'; // Gray-500
+            ctx.fillText('Verteiler', obj.w/2 - 25 / camera.zoom, obj.h/2 + 5 / camera.zoom);
+        }
+        
+        function drawVago(obj) {
+            ctx.fillStyle = ADER_COLORS[obj.vagoType] || '#a1a1aa';
+            
+            ctx.beginPath();
+            ctx.roundRect(0, 0, obj.w, obj.h, 5);
+            ctx.fill();
+            ctx.stroke();
+            ctx.fillStyle = '#ffffff';
+            
+            const text = `Vago ${obj.slots.length}x`;
+            const textWidth = ctx.measureText(text).width * camera.zoom; // Skalierte Breite
+            ctx.fillText(text, (obj.w - textWidth) / 2, obj.h / 2 + 5 / camera.zoom);
+        }
+
+        function drawSlots(obj) {
+            const slotRadius = 8 / camera.zoom;
+            obj.slots.forEach(slot => {
+                const pos = getSlotRelativePos(slot);
+                ctx.fillStyle = ADER_COLORS[slot.type] || '#ffffff';
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 1 / camera.zoom;
+                ctx.beginPath();
+                ctx.arc(pos.x, pos.y, slotRadius, 0, 2 * Math.PI);
+                ctx.fill();
+                ctx.stroke();
+            });
+        }
+        
+        // --- NEU: Überarbeitete Event-Handler (Input) ---
+
+        function getFirstPointerPos() {
+            // Gibt die Position des ersten aktiven Pointers zurück
+            return activePointers.values().next().value || { x: 0, y: 0 };
+        }
+        
+        function getAve
